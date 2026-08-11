@@ -1,6 +1,6 @@
 # a2a-mcp-bridge
 
-A bridge server that exposes Agent2Agent (A2A) remote agents as tools to Model Context Protocol (MCP) clients. It is built natively against the MCP `2026-07-28` specification revision and targets A2A 1.0. See `SPEC-NOTES.md` for the protocol research this project is built on and `CLAUDE.md` for the working rules that govern this codebase.
+A bridge server that exposes Agent2Agent (A2A) remote agents as tools to Model Context Protocol (MCP) clients. It is built natively against the MCP `2026-07-28` specification revision and targets A2A 1.0. See `SPEC-NOTES.md` for the protocol research.
 
 ## Overview
 
