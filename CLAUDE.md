@@ -88,6 +88,15 @@ degrades.
   A2A's `GetTask`/`SendMessage`/`CancelTask` — same shape of idea, two different wire
   protocols, translated by `mapping.py`. Keep the two method-name namespaces mentally and
   lexically separate in code (don't reuse a bare `get_task` helper name for both, etc.).
+- No treating `TASK_STATE_AUTH_REQUIRED` as `INPUT_REQUIRED` with a password field. A2A
+  requires credentials to be exchanged out-of-band unless an in-band mechanism was
+  explicitly negotiated; the agent may resume on its own once satisfied, with no
+  follow-up message. Anything placed in `inputResponses` passes through the calling
+  model's context — transcripts, logs, anywhere else context goes — so a credential
+  routed that way is a security bug, not a shortcut. Surface the challenge (URL or
+  instruction) for out-of-band completion and resume by polling; never build a
+  `requestedSchema` for this path that a model could fill with a secret. See
+  SPEC-NOTES §14 and `mapping.py::auth_requests_for_task`.
 
 ## Working process
 

@@ -143,6 +143,19 @@ def _translate_tasks_error(exc: tasks.TasksError) -> BridgeError:
             http_status=400,
             data={"requiredCapabilities": exc.required},
         )
+    if isinstance(exc, tasks.TaskAlreadyTerminal):
+        # A2A's own UnsupportedOperationError (-32004) mapped, not leaked --
+        # see tasks.py::tasks_update.
+        return BridgeError(
+            INVALID_PARAMS, str(exc), http_status=400, data={"reason": "task_terminal", "a2aState": exc.a2a_state_name}
+        )
+    if isinstance(exc, tasks.TaskNotAwaitingInput):
+        return BridgeError(
+            INVALID_PARAMS,
+            str(exc),
+            http_status=400,
+            data={"reason": "not_awaiting_input", "a2aState": exc.a2a_state_name},
+        )
     if isinstance(exc, tasks.DownstreamAgentError):
         return BridgeError(INTERNAL_ERROR, str(exc), http_status=500)
     # InvalidTaskHandle, UnknownTool, ElicitationNotAccepted,

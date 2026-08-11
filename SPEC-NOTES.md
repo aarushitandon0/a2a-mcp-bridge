@@ -505,3 +505,68 @@ Per the user's explicit direction: `SendMessage` MAY dedupe on `messageId` (A2A 
 
 ---
 
+## 14. M3 findings — schema derivation and `AUTH_REQUIRED`, redefined per user direction 2026-08-11
+
+M3 as originally scoped (build brief) largely already existed after M2 (`tasks/update` with `inputResponses`, tested through a full round trip). The user redefined M3 around two things the original scoping got wrong or left vague: prose-to-schema derivation for `input_required`, and `AUTH_REQUIRED` handling, which the original brief's "InputRequiredResult carrying the auth challenge" phrasing would have made into a credential-handling security bug if implemented literally.
+
+### 14.1 `ElicitRequestURLParams` — merged schema vs. SEP-1036 proposal text disagree; merged schema wins (amendment 4)
+
+Fetched both. **Merged `schema.ts`** (`raw.githubusercontent.com/modelcontextprotocol/specification/main/schema/2026-07-28/schema.ts`, same commit family as earlier fetches):
+```typescript
+export interface ElicitRequestURLParams {
+  mode: "url";
+  message: string;
+  url: string;
+}
+```
+**SEP-1036 proposal text** (`modelcontextprotocol/modelcontextprotocol/seps/1036-url-mode-elicitation-for-secure-out-of-band-intera.md`) additionally described an `elicitationId: string` field and a server-initiated `notifications/elicitation/complete` notification carrying it. **Neither `elicitationId` nor the completion notification made it into the merged schema.** Per amendment 4 (SEP PRs describe proposals that get amended before merge; take field names from the merged schema, not the PR/SEP text), this bridge uses the three-field shape above, with no `elicitationId` and no reliance on a completion notification ever arriving. Confirmed also from `ElicitResult` staying unchanged: `{action: "accept"|"decline"|"cancel", content?: {...}}`, `content` omitted for url-mode responses per its own doc comment ("Omitted for out-of-band mode responses").
+
+The SEP's own rationale (fetched for context, not for field names): url-mode elicitation exists specifically so that "API keys, passwords, and other credentials must never transit through intermediary systems" — for OAuth-style external-authorization flows and PCI-relevant payment flows. It does **not** mention A2A's `AUTH_REQUIRED` state at all; the connection between the two is this project's own, not a documented cross-reference. Worth stating plainly since it means the design decision in §14.2 below is this bridge's synthesis of two independent specs' security postures, not something either spec spells out jointly.
+
+### 14.2 `TASK_STATE_AUTH_REQUIRED` ≠ `INPUT_REQUIRED` with a form — corrects the original build brief
+
+The original brief (§3.1's table) said: `TASK_STATE_AUTH_REQUIRED` → interrupted → "`InputRequiredResult` carrying the auth challenge." Read literally today, against the design this bridge actually settled on (Tasks-extension `inputRequests`/`tasks/update`, not core `InputRequiredResult` — see §3.1 above), this would mean: surface a form-mode elicitation asking for a credential, and forward the client's answer into the A2A task via `tasks/update` → `SendMessage`, exactly like a normal `input_required` answer. **That is a real security bug, flagged by the user before it was built, not caught after the fact:**
+
+- A2A's own spec requires credentials to be exchanged out-of-band unless an in-band mechanism was explicitly negotiated, and states the agent **may resume on its own once the credential arrives, with no follow-up message required**.
+- Anything placed in MCP's `inputResponses` travels through the calling model's context — transcripts, logs, anywhere else context goes. A credential routed that way is exposed to every layer of that pipeline, which is precisely what A2A's out-of-band requirement and MCP's own SEP-1036 (§14.1) both exist to prevent.
+- A2A's spec text also warns explicitly that in-band credential exchange exposes credentials to every agent in a chain (already noted in the original build brief's own §3.1 bullet on `AUTH_REQUIRED` chains) — the same underlying concern from a different angle.
+
+**Resolution, implemented in `mapping.py::auth_requests_for_task` and `tasks.py::tasks_update`:**
+- `AUTH_REQUIRED` still collapses to MCP status `"input_required"` (MCP's `TaskStatus` enum has no separate value — confirmed, see §3), but is routed through a **separate key** (`AUTH_REQUEST_KEY = "auth"`, distinct from `INPUT_REQUEST_KEY = "response"`) and a **separate builder function**, decided from the *raw* A2A state (`a2a_task.status.state`), not the already-collapsed MCP status string — collapsing first and branching after would have silently reintroduced the conflation risk.
+- If the agent's status message contains a `url`-kind `Part`, build a SEP-1036 url-mode elicitation (§14.1's three-field shape) — no `requestedSchema` at all, so there is structurally nothing for a model to populate.
+- If there's no URL, fall back to a message-only elicitation with `requestedSchema: {type: "object", properties: {}, required: []}` — zero properties, so even in the worst case there is no fillable field, regardless of what the agent's prose says. Tested directly: `tests/test_mapping.py::test_auth_requests_never_produces_a_credential_shaped_field_even_if_agent_text_asks_for_one` constructs a status message that literally asks for a password and API key, and asserts the resulting schema still has empty `properties`. The guarantee is structural, not a keyword filter on the agent's text.
+- `tasks/update` for the `auth` key **never calls `a2a_client.send_message`** — it validates `action == "accept"` and returns the bare ack. The client's role is only ever to consent/acknowledge; A2A's own resume-on-its-own semantics mean forwarding anything into the task would be both unnecessary and a channel this design is specifically trying to close. Tested end-to-end (`test_auth_required_full_flow_never_sends_anything_into_a2a`): agent posts a url-mode challenge, client "accepts," asserted zero `SendMessage` calls resulted, then the agent independently transitions to `WORKING`→`COMPLETED` (simulating out-of-band resumption) and the client reaches `completed` purely by polling.
+- Answering an outstanding `AUTH_REQUIRED` with the *ordinary* `response` key (as if it were a normal question) is rejected (`MissingInputResponse`) rather than silently accepted — tested (`test_auth_required_answered_with_wrong_key_is_rejected`) — since accepting it would open exactly the credential-mislabeling risk this whole section exists to close.
+
+CLAUDE.md's anti-goals list was updated with this rule directly (not just recorded here), since it's exactly the kind of thing a future edit relying on the original brief's literal wording could reintroduce.
+
+### 14.3 Schema derivation for `input_required` — prefer a structured `DataPart`, else free text; never invent structure
+
+A2A's `TaskStatus.message` is prose (a `Message` with `Part`s); MCP's `inputRequests` wants a JSON Schema. This is a genuine, unavoidable translation gap between the two protocols — there is no spec text on either side that resolves it, because it's not really a single-protocol question. Per user direction: derive from a structured `DataPart` when the agent provides one, otherwise fall back to a single free-text field, and never synthesize a schema the agent didn't actually signal.
+
+Implementation (`mapping.py`): if any `Part` in the status message has its `data` field set (a `google.protobuf.Value` wrapping a `struct_value` — confirmed via `Part.DESCRIPTOR`, not assumed; see §13.1), decode it with `google.protobuf.json_format.MessageToDict` and build one JSON Schema property per key, typed from the concrete Python value (`bool`→`boolean`, `int`/`float`→`number`, `list`→`array`, `dict`→`object`, else `string`), all marked required. No field is invented that wasn't a key in the agent's own example — tested directly (`test_input_requests_for_task_does_not_synthesise_fields_not_present`). Absent a `DataPart`, falls back to the pre-M3 single `message: string` field.
+
+**Reply shape must match request shape**, which forced a design change in `a2a_client.send_message` (now accepts `text` *or* `data`, mutually exclusive) and in `tasks.py::tasks_update` (re-fetches the task via `GetTask` before replying — needed anyway for the terminal-state check in §14.4 — and checks whether *that* status message has a `DataPart` to decide whether to reply with a structured `Part(data=...)` or a plain `Part(text=...)`). Wire shape for a structured `data` Part, captured empirically rather than assumed: `google.protobuf.Value`'s well-known-type JSON mapping collapses a `struct_value` directly to a plain JSON object under the `data` key — `{"data": {"city": "Paris", "confirm": true}}`, not `{"data": {"structValue": {...}}}`. Verified by round-tripping through the SDK's own `json_format.MessageToDict`/`ParseDict` before writing any fake-agent test fixtures by hand.
+
+### 14.4 `tasks/update` against a terminal task — A2A's `UnsupportedOperationError` (code `-32004`) mapped, not leaked
+
+Confirmed via the installed SDK (`a2a.utils.errors.JSON_RPC_ERROR_CODE_MAP`), not guessed: `UnsupportedOperationError` = A2A JSON-RPC code `-32004` (alongside `TaskNotFoundError`=`-32001`, `TaskNotCancelableError`=`-32002`, `PushNotificationNotSupportedError`=`-32003`, in a private A2A error-code space distinct from both the base JSON-RPC codes and MCP's own `-3202x` range — see §10's note on the two code spaces never being interchangeable).
+
+Two layers, both tested independently against the fake agent:
+1. **Preemptive**: `tasks_update` already fetches the current `Task` via `GetTask` (needed for §14.3's reply-shape decision); if its state is one of the four terminal A2A states, it raises a clean `TaskAlreadyTerminal` error *before* ever attempting `SendMessage` — `test_tasks_update_against_terminal_task_is_rejected_without_ever_calling_send_message` asserts zero `SendMessage` calls resulted.
+2. **Defense-in-depth**: `send_message` is still wrapped to catch the SDK's `UnsupportedOperationError` specifically (not the generic `A2AClientError`) and translate it the same way, covering the race window between the `GetTask` fetch and the `SendMessage` call — `test_tasks_update_maps_a2a_unsupported_operation_error_without_leaking_it_raw` forces this path independent of the preemptive check (the fake agent is configured to reject `SendMessage` for a specific task id regardless of what `GetTask` reports) and asserts the raw A2A code never appears in the MCP-facing error message.
+
+Both surface as MCP `-32602 Invalid params` with `data: {reason: "task_terminal", a2aState: "TASK_STATE_..."}`  — no MCP code maps naturally to "operation invalid given current server-side state" any better than the existing `expired`-handle precedent from M2 (§12c), so the same pattern (shared code family, distinguishing `data.reason`) was reused rather than inventing a new one.
+
+A third related case, not explicitly requested but symmetric with the above: `tasks/update` against a task that's merely `WORKING`/`SUBMITTED` (nothing outstanding to answer) is rejected the same way, `data.reason: "not_awaiting_input"` — tested (`test_tasks_update_when_task_is_just_working_is_rejected`).
+
+### 14.5 Confirmed: all five envelope-rejection tests from the original build brief §4 exist and pass
+
+Re-verified by name, not just by count, since the design moved from a `requestState` field to a sealed `taskId` (§11/§12a) and it would have been easy to lose one silently in the rewrite: `test_rejects_bad_mac_wrong_key`, `test_rejects_bit_flipped_ciphertext`, `test_rejects_expired_envelope`, `test_rejects_unknown_envelope_version`, `test_rejects_unknown_agent_not_in_allowlist` — all five present in `tests/test_state_envelope.py`, all passing (confirmed 2026-08-11 alongside the full 101-test run).
+
+### 14.6 Conformance regression check (2026-08-11, post-M3)
+
+Re-ran the three scenarios M1/M2 had already characterized (`server-stateless`, `tools-list`, `http-header-validation`) against a live instance after the M3 changes: identical scores to the M2 baseline (20/24, 3/3, 13/14 respectively) — no regression. No M3-specific conformance scenario exists to check against (the `input-required-result-*` scenarios target the core, non-Tasks-extension `requestState` pattern this bridge deliberately doesn't use, per §3.1; the `tasks-*` scenarios remain gated on hardcoded diagnostic fixture tools per §13.6).
+
+---
+

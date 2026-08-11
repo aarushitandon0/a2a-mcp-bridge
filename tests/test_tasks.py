@@ -216,3 +216,211 @@ def test_retrying_tools_call_with_same_arguments_does_not_duplicate_the_a2a_task
     _call_summarize(client, text="same text")
     message_ids = [p["message"]["messageId"] for p in fake.received_send_message_params]
     assert message_ids[0] == message_ids[1]
+
+
+# -- M3: two sequential input-required rounds on one task.
+
+
+def test_two_sequential_input_required_rounds(app_and_agent):
+    client, fake = app_and_agent
+    call_resp = _call_summarize(client)
+    task_id = call_resp.json()["result"]["taskId"]
+    a2a_task_id = next(iter(fake.tasks))
+
+    def _update(text):
+        body = _body(
+            method="tasks/update",
+            params={"taskId": task_id, "inputResponses": {"response": {"action": "accept", "content": {"message": text}}}},
+        )
+        return client.post("/", json=body, headers=_headers(method="tasks/update"))
+
+    fake.set_state(a2a_task_id, "TASK_STATE_INPUT_REQUIRED", message_text="Which format?")
+    resp1 = _update("PDF")
+    assert resp1.status_code == 200
+
+    fake.set_state(a2a_task_id, "TASK_STATE_INPUT_REQUIRED", message_text="Which language?")
+    get_resp = client.post(
+        "/", json=_body(method="tasks/get", params={"taskId": task_id}), headers=_headers(method="tasks/get")
+    )
+    assert get_resp.json()["result"]["statusMessage"] == "Which language?"
+    resp2 = _update("English")
+    assert resp2.status_code == 200
+
+    texts_sent = [p["message"]["parts"][0]["text"] for p in fake.received_send_message_params[1:]]
+    assert texts_sent == ["PDF", "English"]
+    # both rounds continued the SAME A2A task -- never opened a second one
+    assert list(fake.tasks) == [a2a_task_id]
+    # and the two rounds got different messageIds despite hitting the same
+    # task (different answer text)
+    message_ids = [p["message"]["messageId"] for p in fake.received_send_message_params[1:]]
+    assert message_ids[0] != message_ids[1]
+
+    fake.set_state(a2a_task_id, "TASK_STATE_COMPLETED")
+    final = client.post(
+        "/", json=_body(method="tasks/get", params={"taskId": task_id}), headers=_headers(method="tasks/get")
+    )
+    assert final.json()["result"]["status"] == "completed"
+
+
+# -- M3: tasks/update against a terminal task -- A2A's UnsupportedOperationError
+# mapped cleanly, never leaked raw.
+
+
+def test_tasks_update_against_terminal_task_is_rejected_without_ever_calling_send_message(app_and_agent):
+    client, fake = app_and_agent
+    call_resp = _call_summarize(client)
+    task_id = call_resp.json()["result"]["taskId"]
+    a2a_task_id = next(iter(fake.tasks))
+    fake.set_state(a2a_task_id, "TASK_STATE_COMPLETED")
+
+    calls_before = len(fake.received_send_message_params)
+    body = _body(
+        method="tasks/update",
+        params={"taskId": task_id, "inputResponses": {"response": {"action": "accept", "content": {"message": "x"}}}},
+    )
+    resp = client.post("/", json=body, headers=_headers(method="tasks/update"))
+    assert resp.status_code == 400
+    error = resp.json()["error"]
+    assert error["code"] == -32602
+    assert error["data"]["reason"] == "task_terminal"
+    assert error["data"]["a2aState"] == "TASK_STATE_COMPLETED"
+    # never attempted to send anything into the terminal task
+    assert len(fake.received_send_message_params) == calls_before
+
+
+def test_tasks_update_maps_a2a_unsupported_operation_error_without_leaking_it_raw(app_and_agent):
+    # Simulates the race window between the bridge's own GetTask (reports
+    # non-terminal) and its SendMessage (A2A itself rejects) -- the fake
+    # agent is configured to reject SendMessage for this task id
+    # unconditionally, independent of what GetTask reports.
+    client, fake = app_and_agent
+    call_resp = _call_summarize(client)
+    task_id = call_resp.json()["result"]["taskId"]
+    a2a_task_id = next(iter(fake.tasks))
+    fake.set_state(a2a_task_id, "TASK_STATE_INPUT_REQUIRED", message_text="Which format?")
+    fake.unsupported_operation_task_ids.add(a2a_task_id)
+
+    body = _body(
+        method="tasks/update",
+        params={"taskId": task_id, "inputResponses": {"response": {"action": "accept", "content": {"message": "PDF"}}}},
+    )
+    resp = client.post("/", json=body, headers=_headers(method="tasks/update"))
+    assert resp.status_code == 400
+    error = resp.json()["error"]
+    assert error["code"] == -32602
+    assert error["data"]["reason"] == "task_terminal"
+    # the raw A2A error text/code never appears verbatim in the MCP error
+    assert "-32004" not in error["message"]
+
+
+def test_tasks_update_when_task_is_just_working_is_rejected(app_and_agent):
+    client, fake = app_and_agent
+    call_resp = _call_summarize(client)
+    task_id = call_resp.json()["result"]["taskId"]
+    # freshly created task is TASK_STATE_WORKING -- nothing outstanding
+    body = _body(
+        method="tasks/update",
+        params={"taskId": task_id, "inputResponses": {"response": {"action": "accept", "content": {"message": "x"}}}},
+    )
+    resp = client.post("/", json=body, headers=_headers(method="tasks/update"))
+    assert resp.status_code == 400
+    assert resp.json()["error"]["data"]["reason"] == "not_awaiting_input"
+
+
+# -- M3: TASK_STATE_AUTH_REQUIRED is a distinct path -- never inputResponses
+# carrying a credential, never forwarded into the A2A task.
+
+
+def test_auth_required_full_flow_never_sends_anything_into_a2a(app_and_agent):
+    client, fake = app_and_agent
+    call_resp = _call_summarize(client)
+    task_id = call_resp.json()["result"]["taskId"]
+    a2a_task_id = next(iter(fake.tasks))
+
+    fake.set_state_with_parts(
+        a2a_task_id,
+        "TASK_STATE_AUTH_REQUIRED",
+        [{"url": "https://idp.example/authorize?req=abc"}, {"text": "Please sign in."}],
+    )
+    get_resp = client.post(
+        "/", json=_body(method="tasks/get", params={"taskId": task_id}), headers=_headers(method="tasks/get")
+    )
+    result = get_resp.json()["result"]
+    assert result["status"] == "input_required"
+    auth_request = result["inputRequests"]["auth"]
+    assert auth_request["params"]["mode"] == "url"
+    assert auth_request["params"]["url"] == "https://idp.example/authorize?req=abc"
+    assert "requestedSchema" not in auth_request["params"]
+
+    calls_before = len(fake.received_send_message_params)
+    update_body = _body(
+        method="tasks/update",
+        params={"taskId": task_id, "inputResponses": {"auth": {"action": "accept"}}},
+    )
+    update_resp = client.post("/", json=update_body, headers=_headers(method="tasks/update"))
+    assert update_resp.status_code == 200
+    assert update_resp.json()["result"] == {"resultType": "complete"}
+    # the acknowledgment must NEVER be forwarded into the A2A task -- the
+    # agent resumes on its own once authenticated, per A2A's own semantics
+    assert len(fake.received_send_message_params) == calls_before
+
+    # agent resumes entirely on its own (out-of-band credential arrived) --
+    # the bridge only ever polls from here
+    fake.set_state(a2a_task_id, "TASK_STATE_WORKING")
+    fake.set_state(a2a_task_id, "TASK_STATE_COMPLETED")
+    final = client.post(
+        "/", json=_body(method="tasks/get", params={"taskId": task_id}), headers=_headers(method="tasks/get")
+    )
+    assert final.json()["result"]["status"] == "completed"
+
+
+def test_auth_required_answered_with_wrong_key_is_rejected(app_and_agent):
+    client, fake = app_and_agent
+    call_resp = _call_summarize(client)
+    task_id = call_resp.json()["result"]["taskId"]
+    a2a_task_id = next(iter(fake.tasks))
+    fake.set_state_with_parts(a2a_task_id, "TASK_STATE_AUTH_REQUIRED", [{"url": "https://idp.example/authorize"}])
+
+    # answering with the ordinary "response" key (as if it were a normal
+    # input_required question) must not be accepted as an auth acknowledgment
+    body = _body(
+        method="tasks/update",
+        params={"taskId": task_id, "inputResponses": {"response": {"action": "accept", "content": {"message": "hunter2"}}}},
+    )
+    resp = client.post("/", json=body, headers=_headers(method="tasks/update"))
+    assert resp.status_code == 400
+    assert len(fake.received_send_message_params) == 1  # only the original tools/call
+
+
+# -- M3: structured DataPart input_required round trip end-to-end.
+
+
+def test_structured_input_required_round_trip(app_and_agent):
+    client, fake = app_and_agent
+    call_resp = _call_summarize(client)
+    task_id = call_resp.json()["result"]["taskId"]
+    a2a_task_id = next(iter(fake.tasks))
+
+    fake.set_state_with_parts(
+        a2a_task_id,
+        "TASK_STATE_INPUT_REQUIRED",
+        [{"data": {"city": "Paris", "confirm": True}}, {"text": "Where and confirm?"}],
+    )
+    get_resp = client.post(
+        "/", json=_body(method="tasks/get", params={"taskId": task_id}), headers=_headers(method="tasks/get")
+    )
+    schema = get_resp.json()["result"]["inputRequests"]["response"]["params"]["requestedSchema"]
+    assert schema["properties"] == {"city": {"type": "string"}, "confirm": {"type": "boolean"}}
+
+    update_body = _body(
+        method="tasks/update",
+        params={
+            "taskId": task_id,
+            "inputResponses": {"response": {"action": "accept", "content": {"city": "Lyon", "confirm": False}}},
+        },
+    )
+    resp = client.post("/", json=update_body, headers=_headers(method="tasks/update"))
+    assert resp.status_code == 200
+
+    sent_part = fake.received_send_message_params[-1]["message"]["parts"][0]
+    assert sent_part["data"] == {"city": "Lyon", "confirm": False}

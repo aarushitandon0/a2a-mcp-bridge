@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import Any
 
 from a2a.types import a2a_pb2 as _a2a_pb2
+from google.protobuf import json_format
 
 from bridge import artifacts
 
@@ -93,36 +94,117 @@ def _status_message_text(a2a_task: Any) -> str | None:
     return text or None
 
 
+def _url_part(a2a_task: Any) -> str | None:
+    for part in a2a_task.status.message.parts:
+        if part.WhichOneof("content") == "url":
+            return part.url
+    return None
+
+
+def data_part_dict(a2a_task: Any) -> dict | None:
+    """The first structured DataPart in the status message, as a plain
+    dict, or None if there isn't one. Used to derive a real schema instead
+    of guessing one -- see input_requests_for_task.
+    """
+    for part in a2a_task.status.message.parts:
+        if part.WhichOneof("content") == "data":
+            decoded = json_format.MessageToDict(part.data)
+            if isinstance(decoded, dict) and decoded:
+                return decoded
+    return None
+
+
+def _json_type_for(value: Any) -> str:
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return "string"
+
+
+def _schema_from_example(example: dict) -> dict:
+    """Derive a JSON Schema from a concrete example the agent actually
+    sent -- field names and types come directly from `example`, nothing is
+    invented (build brief / user direction: "do not synthesise structure
+    that isn't there").
+    """
+    properties = {key: {"type": _json_type_for(value)} for key, value in example.items()}
+    return {"type": "object", "properties": properties, "required": list(properties)}
+
+
 # Synthetic key for the single elicitation this bridge raises per
-# input_required/auth_required task. A2A doesn't hand back multiple
-# discrete input requests for one status -- see SPEC-NOTES.md §3.1/§11 for
-# why Tasks-extension inputRequests (not core requestState) is the right
+# input_required task. A2A doesn't hand back multiple discrete input
+# requests for one status -- see SPEC-NOTES.md §3.1/§11 for why
+# Tasks-extension inputRequests (not core requestState) is the right
 # mechanism here, and this module's docstring for why the shape below
 # (one ElicitRequest keyed "response") is this bridge's own design choice,
 # not a spec-mandated structure.
 INPUT_REQUEST_KEY = "response"
 
+# Separate key for AUTH_REQUIRED -- deliberately never sharing a key or a
+# schema shape with INPUT_REQUEST_KEY. See auth_requests_for_task.
+AUTH_REQUEST_KEY = "auth"
+
 
 def input_requests_for_task(a2a_task: Any) -> dict:
+    """TASK_STATE_INPUT_REQUIRED -> inputRequests. A2A hands back prose in
+    status.message, not a schema; MCP wants structured inputRequests. This
+    is a genuine translation gap (build brief / user direction), so: prefer
+    a structured DataPart if the agent included one (schema derived from
+    its actual shape), otherwise fall back to a single free-text field --
+    never invent structure the agent didn't provide.
+    """
     prompt = _status_message_text(a2a_task) or "The agent needs additional input to continue."
+    example = data_part_dict(a2a_task)
+    if example is not None:
+        schema = _schema_from_example(example)
+    else:
+        schema = {
+            "type": "object",
+            "properties": {"message": {"type": "string", "description": "Your response to the agent."}},
+            "required": ["message"],
+        }
     return {
         INPUT_REQUEST_KEY: {
             "method": "elicitation/create",
-            "params": {
-                "message": prompt,
-                "requestedSchema": {
-                    "type": "object",
-                    "properties": {
-                        "message": {
-                            "type": "string",
-                            "description": "Your response to the agent.",
-                        }
-                    },
-                    "required": ["message"],
-                },
-            },
+            "params": {"message": prompt, "requestedSchema": schema},
         }
     }
+
+
+def auth_requests_for_task(a2a_task: Any) -> dict:
+    """TASK_STATE_AUTH_REQUIRED -> inputRequests. NOT "input_required with a
+    password field" -- the A2A spec requires credentials to be exchanged
+    out-of-band unless an in-band mechanism was explicitly negotiated, and
+    the agent may resume on its own once the credential arrives, with no
+    follow-up message required. Anything routed through inputResponses
+    passes through the calling model's context (transcripts, logs,
+    anywhere else context goes) -- credentials must never go there. See
+    CLAUDE.md anti-goals and SPEC-NOTES.md §14.
+
+    If the agent supplied a URL (SEP-1036 url-mode elicitation is exactly
+    this case), surface it for the human to open out-of-band; the schema
+    carries no requestedSchema at all, so there is nothing for a model to
+    fill in. If there's no URL, fall back to a message-only, zero-property
+    schema -- still nothing fillable, just an instruction to wait and poll.
+    Either way, tasks/update for this key never forwards anything into the
+    A2A task (see tasks.py); the client is only ever consenting/polling.
+    """
+    prompt = _status_message_text(a2a_task) or "The agent requires authentication."
+    url = _url_part(a2a_task)
+    if url:
+        params: dict[str, Any] = {"mode": "url", "message": prompt, "url": url}
+    else:
+        params = {
+            "mode": "form",
+            "message": f"{prompt} Complete this out of band; the agent will resume automatically once authenticated.",
+            "requestedSchema": {"type": "object", "properties": {}, "required": []},
+        }
+    return {AUTH_REQUEST_KEY: {"method": "elicitation/create", "params": params}}
 
 
 def completed_task_result(a2a_task: Any) -> dict:
@@ -185,7 +267,13 @@ def a2a_task_to_mcp_task(
         task["statusMessage"] = status_message
 
     if status == "input_required":
-        task["inputRequests"] = input_requests_for_task(a2a_task)
+        # MCP's TaskStatus enum has no separate "auth_required" value (both
+        # A2A states collapse to "input_required" -- see _A2A_STATE_TO_MCP_STATUS),
+        # but the two need very different inputRequests: never conflate them.
+        if a2a_task.status.state == _a2a_pb2.TASK_STATE_AUTH_REQUIRED:
+            task["inputRequests"] = auth_requests_for_task(a2a_task)
+        else:
+            task["inputRequests"] = input_requests_for_task(a2a_task)
     elif status == "completed":
         task["result"] = completed_task_result(a2a_task)
     elif status == "failed":

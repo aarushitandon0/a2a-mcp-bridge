@@ -120,9 +120,116 @@ def test_input_requests_for_task_uses_status_message_as_prompt():
 
 
 def test_input_requests_for_task_falls_back_without_status_message():
-    task = _task(pb2.TASK_STATE_AUTH_REQUIRED)
+    task = _task(pb2.TASK_STATE_INPUT_REQUIRED)
     requests = mapping.input_requests_for_task(task)
     assert requests[mapping.INPUT_REQUEST_KEY]["params"]["message"]
+
+
+# -- Schema derivation from a structured DataPart (user direction: prefer a
+# structured DataPart if present, else fall back to free text; never
+# synthesise structure that isn't there).
+
+
+def _data_message(example: dict, *, text: str | None = None):
+    from google.protobuf.struct_pb2 import Value
+
+    value = Value()
+    value.struct_value.update(example)
+    parts = [Part(data=value)]
+    if text is not None:
+        parts.append(Part(text=text))
+    return Message(message_id="m1", role=pb2.ROLE_AGENT, parts=parts)
+
+
+def _task_with_message(state, message):
+    return Task(id="t1", context_id="c1", status=TaskStatus(state=state, message=message))
+
+
+def test_input_requests_for_task_derives_schema_from_data_part():
+    message = _data_message({"city": "Paris", "confirm": True, "count": 3}, text="Where and how many?")
+    task = _task_with_message(pb2.TASK_STATE_INPUT_REQUIRED, message)
+    requests = mapping.input_requests_for_task(task)
+    schema = requests[mapping.INPUT_REQUEST_KEY]["params"]["requestedSchema"]
+    assert schema["properties"] == {
+        "city": {"type": "string"},
+        "confirm": {"type": "boolean"},
+        "count": {"type": "number"},
+    }
+    assert set(schema["required"]) == {"city", "confirm", "count"}
+    assert requests[mapping.INPUT_REQUEST_KEY]["params"]["message"] == "Where and how many?"
+
+
+def test_input_requests_for_task_does_not_synthesise_fields_not_present():
+    # Only what the agent actually sent becomes a schema field -- nothing
+    # invented, per user direction.
+    message = _data_message({"onlyField": "example"})
+    task = _task_with_message(pb2.TASK_STATE_INPUT_REQUIRED, message)
+    requests = mapping.input_requests_for_task(task)
+    schema = requests[mapping.INPUT_REQUEST_KEY]["params"]["requestedSchema"]
+    assert list(schema["properties"]) == ["onlyField"]
+    assert "message" not in schema["properties"]
+
+
+def test_input_requests_for_task_falls_back_to_free_text_without_data_part():
+    task = _task(pb2.TASK_STATE_INPUT_REQUIRED, message_text="What is your name?")
+    requests = mapping.input_requests_for_task(task)
+    schema = requests[mapping.INPUT_REQUEST_KEY]["params"]["requestedSchema"]
+    assert list(schema["properties"]) == ["message"]
+
+
+# -- TASK_STATE_AUTH_REQUIRED: never a credential-soliciting schema. See
+# CLAUDE.md anti-goals and SPEC-NOTES.md §14.
+
+
+def _url_message(url: str, *, text: str | None = None):
+    parts = [Part(url=url)]
+    if text is not None:
+        parts.append(Part(text=text))
+    return Message(message_id="m1", role=pb2.ROLE_AGENT, parts=parts)
+
+
+def test_auth_requests_for_task_uses_url_mode_when_agent_provides_a_url():
+    message = _url_message("https://idp.example/authorize?req=abc", text="Please sign in.")
+    task = _task_with_message(pb2.TASK_STATE_AUTH_REQUIRED, message)
+    requests = mapping.auth_requests_for_task(task)
+    params = requests[mapping.AUTH_REQUEST_KEY]["params"]
+    assert params["mode"] == "url"
+    assert params["url"] == "https://idp.example/authorize?req=abc"
+    assert "requestedSchema" not in params  # url mode carries no form at all
+
+
+def test_auth_requests_for_task_falls_back_to_empty_schema_without_a_url():
+    task = _task(pb2.TASK_STATE_AUTH_REQUIRED, message_text="Please authenticate with the operator.")
+    requests = mapping.auth_requests_for_task(task)
+    params = requests[mapping.AUTH_REQUEST_KEY]["params"]
+    assert params["mode"] == "form"
+    assert params["requestedSchema"] == {"type": "object", "properties": {}, "required": []}
+
+
+def test_auth_requests_never_produces_a_credential_shaped_field_even_if_agent_text_asks_for_one():
+    # Even a maximally hostile/naive agent message that literally asks for a
+    # password must not result in a fillable field -- this is a structural
+    # guarantee (empty properties), not a keyword filter on the prompt text.
+    task = _task(
+        pb2.TASK_STATE_AUTH_REQUIRED,
+        message_text="Please provide your password and API key to continue: ",
+    )
+    requests = mapping.auth_requests_for_task(task)
+    params = requests[mapping.AUTH_REQUEST_KEY]["params"]
+    assert params.get("requestedSchema", {}).get("properties", {}) == {}
+    # and the prompt text itself never becomes a form field name/value pair
+    assert "password" not in params.get("requestedSchema", {}).get("properties", {})
+
+
+def test_a2a_task_to_mcp_task_routes_auth_required_to_auth_requests_not_input_requests():
+    message = _url_message("https://idp.example/authorize")
+    task = _task_with_message(pb2.TASK_STATE_AUTH_REQUIRED, message)
+    result = mapping.a2a_task_to_mcp_task(
+        task, mcp_task_id="sealed-abc", created_at_iso="t0", last_updated_at_iso="t1", ttl_ms=60_000,
+    )
+    assert result["status"] == "input_required"  # MCP has no separate auth_required status
+    assert mapping.AUTH_REQUEST_KEY in result["inputRequests"]
+    assert mapping.INPUT_REQUEST_KEY not in result["inputRequests"]
 
 
 def test_completed_task_result_from_artifacts():

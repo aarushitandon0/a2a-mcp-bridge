@@ -147,6 +147,11 @@ class FakeA2AAgent:
         self.received_send_message_params: list[dict] = []
         self.received_headers: list[dict] = []
         self._next_id = 0
+        # Task ids that must reject SendMessage with A2A's own
+        # UnsupportedOperationError (-32004), regardless of GetTask's
+        # reported state -- for testing the defense-in-depth catch
+        # independent of the bridge's own preemptive terminal-state check.
+        self.unsupported_operation_task_ids: set[str] = set()
 
     def new_task_id(self) -> str:
         self._next_id += 1
@@ -178,6 +183,16 @@ class FakeA2AAgent:
             }
         task["status"] = status
 
+    def set_state_with_parts(self, task_id: str, state: str, parts: list[dict]):
+        """Like set_state, but with raw wire-shape message parts (e.g.
+        [{"data": {...}}] or [{"url": "..."}]) for scenarios set_state's
+        text-only shortcut can't express.
+        """
+        self.tasks[task_id]["status"] = {
+            "state": state,
+            "message": {"messageId": "update-msg", "role": "ROLE_AGENT", "parts": parts},
+        }
+
     # Controls what state a NEWLY created task (no taskId in the incoming
     # message) starts in -- override per test, e.g. to simulate a task that
     # is already input_required on its very first return.
@@ -195,6 +210,14 @@ class FakeA2AAgent:
             message = params["message"]
             task_id = message.get("taskId")
             context_id = message.get("contextId")
+            if task_id and task_id in self.unsupported_operation_task_ids:
+                return JSONResponse(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": {"code": -32004, "message": "unsupported operation: task is terminal"},
+                    }
+                )
             if task_id and task_id in self.tasks:
                 result = {"task": self.tasks[task_id]}
             else:

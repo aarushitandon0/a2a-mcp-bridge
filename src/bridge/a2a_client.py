@@ -30,6 +30,7 @@ from a2a.types import (
     a2a_pb2 as pb2,
 )
 from a2a.types import GetTaskRequest
+from google.protobuf.struct_pb2 import Value
 
 from bridge.config import AgentConfig
 
@@ -92,7 +93,8 @@ async def send_message(
     agent: AgentConfig,
     card: AgentCard,
     *,
-    text: str,
+    text: str | None = None,
+    data: dict | None = None,
     message_id: str,
     a2a_task_id: str | None = None,
     a2a_context_id: str | None = None,
@@ -100,11 +102,26 @@ async def send_message(
     """Non-blocking send (return_immediately=True -- SPEC-NOTES.md §3.1):
     opens a new task if a2a_task_id is None, otherwise continues the
     referenced task (A2A requires context_id to match when both are given).
+
+    Exactly one of `text`/`data` -- reply in kind: if the agent asked via a
+    structured DataPart (mapping.py's input_requests_for_task derived a
+    schema from it), reply with a DataPart back; a free-text question gets
+    a plain text reply. See tasks.py::tasks_update.
     """
+    if (text is None) == (data is None):
+        raise ValueError("send_message requires exactly one of text or data")
+
+    if data is not None:
+        value = Value()
+        value.struct_value.update(data)
+        parts = [Part(data=value)]
+    else:
+        parts = [Part(text=text)]
+
     message_kwargs: dict[str, object] = {
         "message_id": message_id,
         "role": pb2.ROLE_USER,
-        "parts": [Part(text=text)],
+        "parts": parts,
     }
     if a2a_task_id:
         message_kwargs["task_id"] = a2a_task_id

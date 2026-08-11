@@ -16,6 +16,8 @@ from typing import Any
 
 import httpx
 from a2a.client.errors import A2AClientError
+from a2a.types import UnsupportedOperationError as A2AUnsupportedOperationError
+from a2a.types import a2a_pb2 as pb2
 
 from bridge import a2a_client, mapping, state
 from bridge.config import AgentConfig
@@ -77,6 +79,28 @@ class ElicitationNotAccepted(TasksError):
 
 class MissingInputResponse(TasksError):
     pass
+
+
+class TaskNotAwaitingInput(TasksError):
+    """tasks/update was called but the task isn't currently input_required
+    (or auth_required) -- there's nothing outstanding to fulfill."""
+
+    def __init__(self, a2a_state_name: str):
+        super().__init__(f"task is not awaiting input (current A2A state: {a2a_state_name})")
+        self.a2a_state_name = a2a_state_name
+
+
+class TaskAlreadyTerminal(TasksError):
+    """tasks/update against a task that has already reached a terminal A2A
+    state. A2A itself would reject the underlying SendMessage with
+    UnsupportedOperationError; this is either caught defensively from that
+    (see tasks_update) or -- more often -- detected upfront from the same
+    GetTask fetch tasks_update already needs to decide the reply shape, so
+    the client gets a specific error without ever attempting the send."""
+
+    def __init__(self, a2a_state_name: str):
+        super().__init__(f"task is already in a terminal state ({a2a_state_name}) and cannot be updated")
+        self.a2a_state_name = a2a_state_name
 
 
 class DownstreamAgentError(TasksError):
@@ -214,6 +238,22 @@ async def tasks_get(
     return {"resultType": "complete", **task}
 
 
+_TERMINAL_A2A_STATES = {
+    pb2.TASK_STATE_COMPLETED,
+    pb2.TASK_STATE_FAILED,
+    pb2.TASK_STATE_REJECTED,
+    pb2.TASK_STATE_CANCELED,
+}
+
+
+def _require_accepted(response: dict | None, *, key: str) -> dict:
+    if response is None:
+        raise MissingInputResponse(f"expected an input response keyed {key!r}")
+    if response.get("action") != "accept":
+        raise ElicitationNotAccepted(f"client did not accept the elicitation (action={response.get('action')!r})")
+    return response
+
+
 async def tasks_update(
     http_client: httpx.AsyncClient,
     agents: dict[str, AgentConfig],
@@ -225,27 +265,68 @@ async def tasks_update(
     now = time.time() if now is None else now
     handle = _unseal(params["taskId"], keys=keys, agents=agents, now=int(now))
     agent = agents[handle.agent_id]
-
-    input_responses = params.get("inputResponses") or {}
-    response = input_responses.get(mapping.INPUT_REQUEST_KEY)
-    if response is None:
-        raise MissingInputResponse(f"expected an input response keyed {mapping.INPUT_REQUEST_KEY!r}")
-    if response.get("action") != "accept":
-        raise ElicitationNotAccepted(f"client did not accept the elicitation (action={response.get('action')!r})")
-    text = (response.get("content") or {}).get("message", "")
-
     card = await _fetch_card(http_client, agent)
-    message_id = a2a_client.stable_message_id(handle.agent_id, handle.a2a_task_id, text)
+
+    # Fetched fresh rather than trusted from the client's inputResponses key,
+    # for two reasons: (1) whether the outstanding request was input_required
+    # or auth_required determines completely different handling, and A2A's
+    # own state is the authoritative source for that, not which key the
+    # client happened to answer; (2) input_required's reply shape (text vs
+    # structured data) depends on what the agent's *current* status.message
+    # actually looks like -- see mapping.py::input_requests_for_task.
+    try:
+        a2a_task = await a2a_client.get_task(http_client, agent, card, a2a_task_id=handle.a2a_task_id)
+    except A2AClientError as exc:
+        raise DownstreamAgentError(str(exc)) from exc
+
+    a2a_state = a2a_task.status.state
+    input_responses = params.get("inputResponses") or {}
+
+    if a2a_state in _TERMINAL_A2A_STATES:
+        raise TaskAlreadyTerminal(pb2.TaskState.Name(a2a_state))
+
+    if a2a_state == pb2.TASK_STATE_AUTH_REQUIRED:
+        # Never forward anything into the A2A task here. The A2A spec:
+        # credentials are exchanged out-of-band, and the agent may resume
+        # on its own once satisfied, with no follow-up message required.
+        # This call is the client only ever consenting/acknowledging --
+        # see mapping.py::auth_requests_for_task and CLAUDE.md anti-goals.
+        _require_accepted(input_responses.get(mapping.AUTH_REQUEST_KEY), key=mapping.AUTH_REQUEST_KEY)
+        return {"resultType": "complete"}
+
+    if a2a_state != pb2.TASK_STATE_INPUT_REQUIRED:
+        # WORKING/SUBMITTED: nothing outstanding to fulfill.
+        raise TaskNotAwaitingInput(pb2.TaskState.Name(a2a_state))
+
+    response = _require_accepted(input_responses.get(mapping.INPUT_REQUEST_KEY), key=mapping.INPUT_REQUEST_KEY)
+    content = response.get("content") or {}
+
+    # Reply in kind with whatever shape the request offered (SPEC-NOTES.md
+    # §14): structured DataPart -> structured reply; free-text -> text reply.
+    example = mapping.data_part_dict(a2a_task)
+    if example is not None:
+        send_kwargs: dict[str, Any] = {"data": content}
+        digest_text = repr(sorted(content.items()))
+    else:
+        send_kwargs = {"text": content.get("message", "")}
+        digest_text = send_kwargs["text"]
+
+    message_id = a2a_client.stable_message_id(handle.agent_id, handle.a2a_task_id, digest_text)
     try:
         await a2a_client.send_message(
             http_client,
             agent,
             card,
-            text=text,
             message_id=message_id,
             a2a_task_id=handle.a2a_task_id,
             a2a_context_id=handle.a2a_context_id,
+            **send_kwargs,
         )
+    except A2AUnsupportedOperationError as exc:
+        # Defense-in-depth for the race window between our GetTask above and
+        # this SendMessage (the task could have gone terminal in between) --
+        # map cleanly rather than leaking the raw A2A error (user direction).
+        raise TaskAlreadyTerminal(f"unsupported operation: {exc}") from exc
     except A2AClientError as exc:
         raise DownstreamAgentError(str(exc)) from exc
 
