@@ -131,3 +131,147 @@ def fake_agents():
     finally:
         docs.stop()
         code.stop()
+
+
+class FakeA2AAgent:
+    """A scriptable, in-memory A2A JSONRPC agent for M2 tests.
+
+    Statefulness here is fine -- it's a test double standing in for a real
+    remote agent, not the bridge (which must stay stateless). Exercises the
+    exact wire shapes JsonRpcTransport sends, captured empirically (see the
+    a2a_client.py implementation notes) rather than assumed from prose.
+    """
+
+    def __init__(self):
+        self.tasks: dict[str, dict] = {}
+        self.received_send_message_params: list[dict] = []
+        self.received_headers: list[dict] = []
+        self._next_id = 0
+
+    def new_task_id(self) -> str:
+        self._next_id += 1
+        return f"a2a-task-{self._next_id}"
+
+    def seed_task(self, task_id: str, context_id: str, state: str, *, message_text: str | None = None, artifacts=None):
+        status: dict = {"state": state}
+        if message_text is not None:
+            status["message"] = {
+                "messageId": "seed-msg",
+                "role": "ROLE_AGENT",
+                "parts": [{"text": message_text}],
+            }
+        self.tasks[task_id] = {
+            "id": task_id,
+            "contextId": context_id,
+            "status": status,
+            "artifacts": artifacts or [],
+        }
+
+    def set_state(self, task_id: str, state: str, *, message_text: str | None = None):
+        task = self.tasks[task_id]
+        status: dict = {"state": state}
+        if message_text is not None:
+            status["message"] = {
+                "messageId": "update-msg",
+                "role": "ROLE_AGENT",
+                "parts": [{"text": message_text}],
+            }
+        task["status"] = status
+
+    # Controls what state a NEWLY created task (no taskId in the incoming
+    # message) starts in -- override per test, e.g. to simulate a task that
+    # is already input_required on its very first return.
+    initial_state = "TASK_STATE_WORKING"
+
+    async def handle(self, request):
+        body = await request.json()
+        method = body["method"]
+        params = body.get("params", {})
+        req_id = body["id"]
+        self.received_headers.append(dict(request.headers))
+
+        if method == "SendMessage":
+            self.received_send_message_params.append(params)
+            message = params["message"]
+            task_id = message.get("taskId")
+            context_id = message.get("contextId")
+            if task_id and task_id in self.tasks:
+                result = {"task": self.tasks[task_id]}
+            else:
+                task_id = task_id or self.new_task_id()
+                context_id = context_id or f"ctx-{task_id}"
+                self.tasks[task_id] = {
+                    "id": task_id,
+                    "contextId": context_id,
+                    "status": {"state": self.initial_state},
+                }
+                result = {"task": self.tasks[task_id]}
+        elif method == "GetTask":
+            task = self.tasks.get(params["id"])
+            if task is None:
+                return JSONResponse(
+                    {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32001, "message": "task not found"}}
+                )
+            result = task
+        elif method == "CancelTask":
+            task = self.tasks.get(params["id"])
+            if task is None:
+                return JSONResponse(
+                    {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32001, "message": "task not found"}}
+                )
+            task["status"] = {"state": "TASK_STATE_CANCELED"}
+            result = task
+        else:
+            return JSONResponse(
+                {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"unknown method {method}"}}
+            )
+
+        return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": result})
+
+
+def _fake_a2a_agent_app(fake: FakeA2AAgent, card: dict) -> Starlette:
+    async def agent_card(request):
+        return JSONResponse(card)
+
+    return Starlette(
+        routes=[
+            Route("/.well-known/agent-card.json", agent_card, methods=["GET"]),
+            Route("/a2a", fake.handle, methods=["POST"]),
+        ]
+    )
+
+
+@pytest.fixture
+def fake_a2a_agent():
+    """One live A2A agent exposing both the card and a scriptable JSONRPC
+    endpoint, for full tools/call -> tasks/get -> tasks/update round trips.
+    """
+    fake = FakeA2AAgent()
+    card = {
+        "name": "Docs Agent",
+        "description": "Summarizes and answers questions about documents.",
+        "supportedInterfaces": [],  # filled in once the port is known
+        "version": "1.0.0",
+        "capabilities": {},
+        "defaultInputModes": ["text/plain"],
+        "defaultOutputModes": ["text/plain"],
+        "skills": [
+            {
+                "id": "summarize",
+                "name": "Summarize",
+                "description": "Summarize a document.",
+                "tags": ["docs"],
+                "inputModes": ["text/plain"],
+                "outputModes": ["text/plain"],
+            }
+        ],
+    }
+    server = _BackgroundAgent(_fake_a2a_agent_app(fake, card))
+    server.start()
+    card["supportedInterfaces"] = [
+        {"url": f"{server.base_url}/a2a", "protocolBinding": "JSONRPC", "protocolVersion": "1.0"}
+    ]
+    try:
+        yield fake, server.base_url
+    finally:
+        server.stop()

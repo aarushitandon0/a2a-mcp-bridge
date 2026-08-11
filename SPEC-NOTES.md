@@ -425,16 +425,19 @@ What changes, per the user's 2026-08-11 stress test of the sealed-`taskId` desig
 
 ```
 {
-  v: 2,                      // envelope format version (uint8)
-  agent_id: "...",           // short ID, keys into static config — NOT the full agent_url
-  a2a_task_id: <16 bytes>,   // raw UUID bytes, not the 36-char string form
-  a2a_context_id: <16 bytes>,
-  step: <uint>,
-  iat: <uint32, unix seconds>,
-  exp: <uint32, unix seconds>,
+  0: v,               // envelope format version (int)
+  1: agent_id,         // short ID, keys into static config — NOT the full agent_url
+  2: a2a_task_id,      // 16 raw bytes if the agent's id is a UUID, else the string verbatim
+  3: a2a_context_id,   // same encoding rule as a2a_task_id
+  4: iat,              // unix seconds
+  5: exp,              // unix seconds
 }
 ```
-CBOR-encoded (not JSON) before sealing. `agent_id` resolves against `config.py`'s static agent table, which is deployed identically to every bridge instance — so this is configuration, not server-side state, and doesn't reintroduce the thing M4 is proving doesn't exist. Target: under 100 characters for the final base64url `taskId`. Exact byte budget and the CBOR field-key scheme (integer keys, not string keys, to shave more bytes) to be finalized in M2 when `state.py` is written and can be measured directly rather than estimated.
+Integer CBOR keys (not string keys) to shave bytes. `agent_id` resolves against `config.py`'s static agent table, which is deployed identically to every bridge instance — so this is configuration, not server-side state, and doesn't reintroduce the thing M4 is proving doesn't exist.
+
+**No `step` field, dropped from the brief's original sketch.** Verified against `ext-tasks/schema/draft/schema.ts`: `UpdateTaskResult = Result` and `CancelTaskResult = Result` — both bare acknowledgements, neither echoes a `taskId` or `Task` back. There is no mechanism for the server to hand the client a new handle mid-lifecycle, so the sealed `taskId` minted at `tools/call` time must stay byte-for-byte valid through every subsequent `tasks/get`/`tasks/update`/`tasks/cancel` — it cannot be re-sealed with an incremented counter, because the client has no way to learn the new value. A `step` field would either sit permanently at its minted value (dead weight) or be actively wrong if `state.py` ever tried to mutate it. `a2a_task_id`/`a2a_context_id` are themselves already A2A's own round-tracking mechanism (via `Message.reference_task_ids` and A2A's own history) — this bridge doesn't need a parallel counter.
+
+Not yet measured against a live encode -- exact final byte count for the base64url `taskId` (target: under 100 characters) to be confirmed once `state.py` is implemented.
 
 **b) Key rotation.** Since the handle *is* the ciphertext (not a lookup key into a store), rotating `BRIDGE_STATE_KEY` would silently orphan every in-flight task if unseal only tried one key. `state.py` unseal must accept two keys — current and previous — trying current first; seal always uses current only. Config needs `BRIDGE_STATE_KEY` (current) and `BRIDGE_STATE_KEY_PREVIOUS` (optional, unset after the rotation window closes).
 
