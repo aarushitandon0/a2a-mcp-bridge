@@ -365,13 +365,20 @@ def test_auth_required_full_flow_never_sends_anything_into_a2a(app_and_agent):
     assert len(fake.received_send_message_params) == calls_before
 
     # agent resumes entirely on its own (out-of-band credential arrived) --
-    # the bridge only ever polls from here
+    # the bridge only ever polls from here, never sends anything to unblock it
     fake.set_state(a2a_task_id, "TASK_STATE_WORKING")
+    working = client.post(
+        "/", json=_body(method="tasks/get", params={"taskId": task_id}), headers=_headers(method="tasks/get")
+    )
+    assert working.json()["result"]["status"] == "working"
+
     fake.set_state(a2a_task_id, "TASK_STATE_COMPLETED")
     final = client.post(
         "/", json=_body(method="tasks/get", params={"taskId": task_id}), headers=_headers(method="tasks/get")
     )
     assert final.json()["result"]["status"] == "completed"
+    # the whole resume happened via polling -- still not one SendMessage
+    assert len(fake.received_send_message_params) == calls_before
 
 
 def test_auth_required_answered_with_wrong_key_is_rejected(app_and_agent):

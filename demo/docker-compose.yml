@@ -1,0 +1,76 @@
+# M4 statelessness demo: three bridge instances behind nginx round robin,
+# one fake A2A agent in its own container, sharing nothing across bridge
+# instances but config, the seal key, and the agent itself -- see
+# demo/README.md for what this is meant to prove and how to run it.
+#
+# BRIDGE_STATE_KEY (and, only while rotating, BRIDGE_STATE_KEY_PREVIOUS) are
+# read from the shell environment / a `.env` file next to this compose file
+# -- never baked into an image, and identical across bridge1..3 (rotation
+# tests change them by recreating one instance at a time, not by baking a
+# per-instance key).
+
+services:
+  fake-agent:
+    build:
+      context: ..
+      dockerfile: demo/Dockerfile.fake_agent
+    environment:
+      FAKE_AGENT_PUBLIC_URL: "http://fake-agent:8000"
+    ports:
+      # Host-reachable so the demo driver script can call /control/* directly
+      # -- bridge instances still reach this container over the compose
+      # network name (fake-agent:8000), never through this published port.
+      - "8001:8000"
+
+  bridge1:
+    build:
+      context: ..
+      dockerfile: demo/Dockerfile.bridge
+    environment:
+      BRIDGE_INSTANCE_ID: "bridge1"
+      BRIDGE_AGENTS_CONFIG: '[{"agent_id":"docs","base_url":"http://fake-agent:8000"}]'
+      BRIDGE_STATE_KEY: "${BRIDGE_STATE_KEY:?set BRIDGE_STATE_KEY before running the demo}"
+      BRIDGE_STATE_KEY_PREVIOUS: "${BRIDGE_STATE_KEY_PREVIOUS:-}"
+    depends_on:
+      - fake-agent
+    expose:
+      - "8000"
+
+  bridge2:
+    build:
+      context: ..
+      dockerfile: demo/Dockerfile.bridge
+    environment:
+      BRIDGE_INSTANCE_ID: "bridge2"
+      BRIDGE_AGENTS_CONFIG: '[{"agent_id":"docs","base_url":"http://fake-agent:8000"}]'
+      BRIDGE_STATE_KEY: "${BRIDGE_STATE_KEY:?set BRIDGE_STATE_KEY before running the demo}"
+      BRIDGE_STATE_KEY_PREVIOUS: "${BRIDGE_STATE_KEY_PREVIOUS:-}"
+    depends_on:
+      - fake-agent
+    expose:
+      - "8000"
+
+  bridge3:
+    build:
+      context: ..
+      dockerfile: demo/Dockerfile.bridge
+    environment:
+      BRIDGE_INSTANCE_ID: "bridge3"
+      BRIDGE_AGENTS_CONFIG: '[{"agent_id":"docs","base_url":"http://fake-agent:8000"}]'
+      BRIDGE_STATE_KEY: "${BRIDGE_STATE_KEY:?set BRIDGE_STATE_KEY before running the demo}"
+      BRIDGE_STATE_KEY_PREVIOUS: "${BRIDGE_STATE_KEY_PREVIOUS:-}"
+    depends_on:
+      - fake-agent
+    expose:
+      - "8000"
+
+  nginx:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8080:80"
+    depends_on:
+      - bridge1
+      - bridge2
+      - bridge3

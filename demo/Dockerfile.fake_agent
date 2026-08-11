@@ -1,0 +1,18 @@
+# Build context is the repo root (see demo/docker-compose.yml's `context: ..`).
+# Deliberately its own image, its own tiny dependency set (Starlette +
+# uvicorn only -- no a2a-sdk, no cryptography) and its own container: the
+# M4 demo depends on killing bridge instances WITHOUT taking this agent
+# down with them, so it must not share a container, a process, or a
+# filesystem with any bridge instance.
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir "starlette>=0.48" "uvicorn>=0.35"
+
+COPY demo/__init__.py ./demo/__init__.py
+COPY demo/fake_agent ./demo/fake_agent
+
+EXPOSE 8000
+
+CMD ["python", "-m", "uvicorn", "demo.fake_agent.agent:app", "--factory", "--host", "0.0.0.0", "--port", "8000"]

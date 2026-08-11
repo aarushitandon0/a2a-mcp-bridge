@@ -568,5 +568,17 @@ Re-verified by name, not just by count, since the design moved from a `requestSt
 
 Re-ran the three scenarios M1/M2 had already characterized (`server-stateless`, `tools-list`, `http-header-validation`) against a live instance after the M3 changes: identical scores to the M2 baseline (20/24, 3/3, 13/14 respectively) — no regression. No M3-specific conformance scenario exists to check against (the `input-required-result-*` scenarios target the core, non-Tasks-extension `requestState` pattern this bridge deliberately doesn't use, per §3.1; the `tasks-*` scenarios remain gated on hardcoded diagnostic fixture tools per §13.6).
 
+## 15. M4 — `Bridge-Instance-Id` is bridge-internal, not a protocol addition (2026-08-11)
+
+Recorded here even though it introduces no new wire-protocol surface, precisely because CLAUDE.md's "no invented field names" anti-goal is about MCP/A2A fields specifically — worth being explicit that this isn't one, rather than leaving the distinction implicit.
+
+`server.py` adds a `Bridge-Instance-Id` HTTP response header (`_InstanceIdMiddleware`), set from the `BRIDGE_INSTANCE_ID` env var, so the M4 demo and `tests/test_stateless.py` can observe from outside which process served a given request. Deliberately:
+
+- **An HTTP header, never a JSON-RPC body or `_meta` field.** Neither MCP's `2026-07-28` schema nor A2A's proto has any concept of "which server process handled this" — putting it in the wire body would be exactly the kind of invented field name §0 exists to prevent. A header is additive and inert to any conformant client; nothing in `_dispatch`/`mapping.py`/`state.py` ever reads it back.
+- **Never part of a `taskId` handle's contents.** `state.py`'s envelope (§12) carries `agent_id`/`a2a_task_id`/`a2a_context_id`/`exp` only; adding an instance id there would leak which process minted a handle into something the client holds, for zero protocol benefit, and would be a second place capacity has to be spent per §12a's byte-budget accounting.
+- **Optional in production.** `app_from_env()` falls back to a random id when `BRIDGE_INSTANCE_ID` is unset (fine for a single-instance dev run); `demo/docker-compose.yml` sets it explicitly per container (`bridge1`/`bridge2`/`bridge3`) so the demo can identify instances by name.
+
+No source fetch needed for this entry — it's an operational addition this bridge owns outright, not a spec detail.
+
 ---
 

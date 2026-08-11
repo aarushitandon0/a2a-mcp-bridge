@@ -10,19 +10,30 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import uuid
 from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
 from starlette.applications import Starlette
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from bridge import discover, tasks
 from bridge.config import AgentConfig
 
 logger = logging.getLogger("bridge.server")
+
+# Bridge-internal only -- not an MCP or A2A wire-protocol field (nothing in
+# SPEC-NOTES.md defines it because neither spec has a concept of "which
+# server process handled this"). Exists purely so M4's statelessness demo
+# and tests/test_stateless.py can observe, from outside, that a resumed task
+# was actually served by a different process -- never consulted by any
+# protocol logic, and never part of a taskId handle's own contents.
+INSTANCE_ID_HEADER = "Bridge-Instance-Id"
 
 PROTOCOL_VERSION = "2026-07-28"
 PROTOCOL_VERSION_META_KEY = "io.modelcontextprotocol/protocolVersion"
@@ -220,20 +231,58 @@ async def mcp_endpoint(request: Request) -> JSONResponse:
     return JSONResponse({"jsonrpc": "2.0", "id": request_id, "result": result})
 
 
-def create_app(agents: dict[str, AgentConfig], state_keys: list[bytes]) -> Starlette:
+class _InstanceIdMiddleware(BaseHTTPMiddleware):
+    """Stamps every response with the serving instance's id and logs it.
+
+    Deliberately a response header, not a JSON-RPC body/`_meta` field --
+    adding it to the wire protocol itself would violate CLAUDE.md's "no
+    invented field names" rule for something neither spec defines. A header
+    is additive and inert to any conformant client.
+    """
+
+    def __init__(self, app, instance_id: str):
+        super().__init__(app)
+        self._instance_id = instance_id
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        response = await call_next(request)
+        response.headers[INSTANCE_ID_HEADER] = self._instance_id
+        logger.info(
+            "instance=%s method=%s path=%s status=%s",
+            self._instance_id,
+            request.headers.get("mcp-method", "-"),
+            request.url.path,
+            response.status_code,
+        )
+        return response
+
+
+def create_app(
+    agents: dict[str, AgentConfig], state_keys: list[bytes], *, instance_id: str | None = None
+) -> Starlette:
+    resolved_instance_id = instance_id or uuid.uuid4().hex[:8]
+
     @asynccontextmanager
     async def lifespan(app: Starlette):
         app.state.agents = agents
         app.state.state_keys = state_keys
+        app.state.instance_id = resolved_instance_id
         async with httpx.AsyncClient() as client:
             app.state.http_client = client
             yield
 
-    return Starlette(routes=[Route("/", mcp_endpoint, methods=["POST"])], lifespan=lifespan)
+    app = Starlette(routes=[Route("/", mcp_endpoint, methods=["POST"])], lifespan=lifespan)
+    app.add_middleware(_InstanceIdMiddleware, instance_id=resolved_instance_id)
+    return app
 
 
 def app_from_env() -> Starlette:
     from bridge.config import load_agents_from_env
     from bridge.state import load_keys_from_env
 
-    return create_app(load_agents_from_env(), load_keys_from_env())
+    # BRIDGE_INSTANCE_ID is optional -- unset falls back to a random id
+    # (fine for a single-instance dev run); M4's compose file sets it
+    # explicitly per container so the demo/test can tell instances apart.
+    return create_app(
+        load_agents_from_env(), load_keys_from_env(), instance_id=os.environ.get("BRIDGE_INSTANCE_ID")
+    )

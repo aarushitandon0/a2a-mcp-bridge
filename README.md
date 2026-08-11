@@ -1,16 +1,30 @@
 # a2a-mcp-bridge
 
-A stateless bridge exposing A2A remote agents to MCP clients, built native on
-the MCP `2026-07-28` specification. See `SPEC-NOTES.md` for the protocol
-research this project is built on, and `CLAUDE.md` for the working rules.
+A bridge exposing A2A remote agents to MCP clients, holding no bridge-side
+state of its own, built native on the MCP `2026-07-28` specification. See
+`SPEC-NOTES.md` for the protocol research this project is built on, and
+`CLAUDE.md` for the working rules.
 
-**Status:** M0 (recon), M1 (stateless MCP skeleton), M2 (task handles), and
-M3 (input-required schema derivation + auth-required handling) complete.
-`tools/call` opens an A2A task and returns a sealed handle;
-`tasks/get`/`tasks/update`/`tasks/cancel` drive it to completion, including
-two genuinely distinct interrupted paths (a real question vs an
-authentication challenge — see Security below). M4 (statelessness demo), M5
-(identity chain) not started.
+Phrased deliberately as "no bridge-side state," not "stateless": the A2A
+agent on the other end of every call holds real task state throughout a
+run. What this bridge doesn't hold is any of its own — every resume
+operation is reconstructed entirely from a sealed `taskId` handle plus the
+remote agent, never from anything only one bridge process remembers. See
+M4 below.
+
+**Status:** M0 (recon), M1 (stateless MCP skeleton), M2 (task handles), M3
+(input-required schema derivation + auth-required handling), and M4
+(no-bridge-side-state demo) complete. `tools/call` opens an A2A task and
+returns a sealed handle; `tasks/get`/`tasks/update`/`tasks/cancel` drive it
+to completion, including two genuinely distinct interrupted paths (a real
+question vs an authentication challenge — see Security below), and can
+resume on any instance sharing only config, the seal key, and the A2A agent
+— see M4 below; **the M4 container demo itself was written but not run in
+this environment (no Docker install available) — its automated pytest
+coverage (`tests/test_stateless.py`) skips the three container-level tests
+with an explicit reason rather than silently passing when Docker is
+missing, and only its in-process test has actually been verified here.**
+M5 (identity chain) not started.
 
 ## Setup
 
@@ -109,6 +123,23 @@ a genuinely separate path from `INPUT_REQUIRED`:
 asserts this structurally — even a status message that explicitly asks for
 a password produces an empty schema, because the guarantee doesn't depend
 on pattern-matching the agent's prose.
+`tests/test_tasks.py::test_auth_required_full_flow_never_sends_anything_into_a2a`
+covers the other half — not just that nothing crosses the boundary, but that
+a task actually reaches `TASK_STATE_COMPLETED` this way: `AUTH_REQUIRED` →
+acknowledge → agent flips state out-of-band → `tasks/get` observes
+`WORKING` → `COMPLETED`, with zero `SendMessage` calls the entire time.
+Resumption is proven to work, not just proven safe.
+
+**Trade-off accepted, not fixed:** the A2A spec says agents *SHOULD* continue
+accepting messages while a task is `AUTH_REQUIRED`, specifically so a client
+can negotiate, correct, or reject the pending request in-band. This bridge's
+blanket "never forward anything into the A2A task while `AUTH_REQUIRED`"
+rule forecloses that — `tasks/update` on this path can only acknowledge, and
+the sole way to reject the interruption from here is `tasks/cancel`. Given
+the alternative is a path a model's context could use to smuggle a
+credential, this bridge chooses the more restrictive behavior deliberately.
+An agent expecting in-band negotiation during `AUTH_REQUIRED` will not get
+it through this bridge.
 
 ## Design trade-offs
 
@@ -145,6 +176,58 @@ timestamp (A2A's own `Task` message has no such field, and keeping one in
 the envelope purely for display cost more bytes than it was worth — see
 SPEC-NOTES.md §12a). `tasks/get` reports `createdAt` equal to the latest
 known `lastUpdatedAt` rather than the task's true original creation time.
+
+## M4: no bridge-side state
+
+The design claim through M1–M3 was that a sealed `taskId` handle carries
+everything needed to resume a task, so no bridge instance needs to
+remember anything about a call it didn't make. M4 is that claim tested
+against real separate processes rather than asserted from the design.
+
+**`tests/test_stateless.py::test_task_handle_resumes_across_independently_constructed_bridge_instances`**
+runs with the normal `pytest` suite, no Docker required: two fully separate
+`create_app()` Starlette apps — separate objects, separate httpx clients,
+nothing shared except the state key and the fake A2A agent standing in for
+the real remote agent — and a task opened on one resumes correctly on the
+other. This is genuine evidence about the code path, verified in this
+environment.
+
+**The container-level claim — actual separate OS processes, `docker kill`,
+a real nginx round robin — lives in `demo/`** (`docker-compose.yml`,
+`nginx.conf`, `Dockerfile.bridge`, `Dockerfile.fake_agent`, `driver.py`,
+`run_demo.py`; see `demo/README.md` for the full writeup). Three bridge
+containers behind nginx, sharing nothing but `BRIDGE_AGENTS_CONFIG`,
+`BRIDGE_STATE_KEY`, and the fake A2A agent (itself in its own container, so
+killing a bridge instance can't accidentally take it down too). Three
+scenarios, each exercised by both `demo/run_demo.py` (scripted, captured
+output) and `tests/test_stateless.py` (automated, same driver code via
+`demo/driver.py`):
+
+- **Kill one mid-task** — start a task, let it reach `input_required`,
+  `docker kill` the exact instance (identified via the `Bridge-Instance-Id`
+  response header — a bridge-internal header, not part of the MCP or A2A
+  wire protocol) that served the original call, answer the prompt through
+  nginx, confirm it completes and that the instance that served the resume
+  is provably not the one that was killed.
+- **Restart all three** — the stronger variant: restart every bridge
+  container while a task is paused, so none of the original three survives
+  untouched, then confirm the task still resumes.
+- **Key rotation** — mint a handle under `BRIDGE_STATE_KEY=KEY_A`, recreate
+  every instance with `BRIDGE_STATE_KEY=KEY_B` /
+  `BRIDGE_STATE_KEY_PREVIOUS=KEY_A` (the two-key window from the Design
+  trade-offs section above), and confirm the KEY_A-sealed handle still
+  resumes during that window, then that a fresh post-rotation handle also
+  works.
+
+**This part was not run in the environment it was written in** — no Docker
+install was available there. `tests/test_stateless.py`'s three
+container-level tests check `shutil.which("docker")` and skip with an
+explicit reason (visible under `pytest -rs`) rather than silently passing
+when it's missing; they are not marked complete by virtue of existing. Run
+them (`./.venv/Scripts/python -m pytest tests/test_stateless.py -v`, or
+`python demo/run_demo.py` for the scripted version) somewhere Docker is
+installed before treating M4 as actually accepted, and paste the resulting
+transcript here in place of this paragraph.
 
 ## Out of scope: artifact "fetch full detail"
 
