@@ -9,6 +9,7 @@ from bridge.server import create_app
 PROTOCOL_VERSION_META_KEY = "io.modelcontextprotocol/protocolVersion"
 CLIENT_CAPABILITIES_META_KEY = "io.modelcontextprotocol/clientCapabilities"
 PROTOCOL_VERSION = "2026-07-28"
+TEST_STATE_KEY = b"\x03" * 32
 
 
 def _headers(*, protocol_version=PROTOCOL_VERSION, method="server/discover", name=None):
@@ -44,7 +45,7 @@ def _body(
 
 @pytest.fixture
 def client():
-    app = create_app({})
+    app = create_app({}, [TEST_STATE_KEY])
     with TestClient(app) as c:
         yield c
 
@@ -188,7 +189,7 @@ def test_tools_list_end_to_end_against_two_fake_agents(fake_agents):
         agent_id: AgentConfig(agent_id=agent_id, base_url=base_url)
         for agent_id, base_url in fake_agents.items()
     }
-    app = create_app(agents)
+    app = create_app(agents, [TEST_STATE_KEY])
     with TestClient(app) as c:
         resp = c.post(
             "/", json=_body(method="tools/list"), headers=_headers(method="tools/list")

@@ -19,7 +19,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from bridge import discover
+from bridge import discover, tasks
 from bridge.config import AgentConfig
 
 logger = logging.getLogger("bridge.server")
@@ -36,6 +36,7 @@ INVALID_PARAMS = -32602
 INTERNAL_ERROR = -32603
 HEADER_MISMATCH = -32020
 UNSUPPORTED_PROTOCOL_VERSION = -32022
+MISSING_REQUIRED_CLIENT_CAPABILITY = -32021
 
 # method -> params key that Mcp-Name must mirror (SPEC-NOTES.md §4).
 _MCP_NAME_SOURCE_KEY = {
@@ -123,6 +124,32 @@ def _validate_headers(headers: Any, body: dict) -> None:
             )
 
 
+def _translate_tasks_error(exc: tasks.TasksError) -> BridgeError:
+    # tasks.py raises its own domain exceptions rather than importing
+    # BridgeError itself, to keep the dependency direction one-way
+    # (server.py -> tasks.py, never the reverse) -- see tasks.py's module
+    # docstring. This is the single place that translates them.
+    if isinstance(exc, tasks.TaskHandleExpired):
+        # SPEC-NOTES.md §12c: a client presenting an expired handle for a
+        # task that may still be running agent-side needs to know that's
+        # what happened, not get a bare "invalid params."
+        return BridgeError(
+            INVALID_PARAMS, str(exc), http_status=400, data={"reason": "expired", "exp": exc.handle.exp}
+        )
+    if isinstance(exc, tasks.MissingRequiredCapability):
+        return BridgeError(
+            MISSING_REQUIRED_CLIENT_CAPABILITY,
+            str(exc),
+            http_status=400,
+            data={"requiredCapabilities": exc.required},
+        )
+    if isinstance(exc, tasks.DownstreamAgentError):
+        return BridgeError(INTERNAL_ERROR, str(exc), http_status=500)
+    # InvalidTaskHandle, UnknownTool, ElicitationNotAccepted,
+    # MissingInputResponse -- all client-supplied-bad-input cases.
+    return BridgeError(INVALID_PARAMS, str(exc), http_status=400)
+
+
 async def _dispatch(method: str, params: dict, request: Request) -> dict:
     agents: dict[str, AgentConfig] = request.app.state.agents
     http_client: httpx.AsyncClient = request.app.state.http_client
@@ -131,6 +158,19 @@ async def _dispatch(method: str, params: dict, request: Request) -> dict:
         return await discover.discover_result()
     if method == "tools/list":
         return await discover.list_tools_result(http_client, agents)
+
+    if method in ("tools/call", "tasks/get", "tasks/update", "tasks/cancel"):
+        keys: list[bytes] = request.app.state.state_keys
+        handler = {
+            "tools/call": tasks.tools_call,
+            "tasks/get": tasks.tasks_get,
+            "tasks/update": tasks.tasks_update,
+            "tasks/cancel": tasks.tasks_cancel,
+        }[method]
+        try:
+            return await handler(http_client, agents, keys, params)
+        except tasks.TasksError as exc:
+            raise _translate_tasks_error(exc) from exc
 
     # Unknown/removed methods (including pre-2026-07-28 methods like
     # 'initialize' or 'ping') are HTTP 404, not 200 -- confirmed against the
@@ -167,10 +207,11 @@ async def mcp_endpoint(request: Request) -> JSONResponse:
     return JSONResponse({"jsonrpc": "2.0", "id": request_id, "result": result})
 
 
-def create_app(agents: dict[str, AgentConfig]) -> Starlette:
+def create_app(agents: dict[str, AgentConfig], state_keys: list[bytes]) -> Starlette:
     @asynccontextmanager
     async def lifespan(app: Starlette):
         app.state.agents = agents
+        app.state.state_keys = state_keys
         async with httpx.AsyncClient() as client:
             app.state.http_client = client
             yield
@@ -180,5 +221,6 @@ def create_app(agents: dict[str, AgentConfig]) -> Starlette:
 
 def app_from_env() -> Starlette:
     from bridge.config import load_agents_from_env
+    from bridge.state import load_keys_from_env
 
-    return create_app(load_agents_from_env())
+    return create_app(load_agents_from_env(), load_keys_from_env())

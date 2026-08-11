@@ -463,3 +463,45 @@ M0's schema.ts reads were shallow in a few places — I extracted each interface
 
 ---
 
+## 13. M2 findings
+
+### 13.1 SDK API surface used (not previously recorded — discovered by inspecting the installed `a2a-sdk` directly, faster and just as authoritative as re-fetching GitHub for code already pinned in the venv)
+
+- `a2a.client.card_resolver.A2ACardResolver(httpx_client, base_url, agent_card_path=AGENT_CARD_WELL_KNOWN_PATH).get_agent_card(http_kwargs=...)` — confirmed exact signature via `inspect.signature`.
+- Task RPCs go through `a2a.client.transports.jsonrpc.JsonRpcTransport(httpx_client, agent_card, url)` directly, **not** the higher-level `ClientFactory`/`Client` abstraction — that wraps every call (streaming or not) in `AsyncIterator[StreamResponse]`, unneeded complexity here since this bridge always sends non-streaming (`return_immediately: true`). `JsonRpcTransport.send_message/get_task/cancel_task` return the SDK's real proto types directly (`SendMessageResponse`, `Task`).
+- Per-call headers (including `A2A-Version`) go through `ClientCallContext(service_parameters={...})` — `service_parameters` is a plain `dict[str, str]`, merged into `httpx`'s request headers by `get_http_args()`. Confirmed by reading `a2a/client/transports/http_helpers.py` directly, not guessed.
+- **Wire shapes captured empirically**, not derived from prose: mounted a recording `httpx.AsyncBaseTransport` and inspected the actual JSON `JsonRpcTransport` sends. `SendMessage` params: `{message: {messageId, role, parts: [{text}], taskId?, contextId?}, configuration: {returnImmediately}}` (camelCase, protobuf JSON mapping). `GetTask`/`CancelTask` params: `{id}` — **not** `{taskId}`, despite the MCP-side Tasks extension using `taskId` for the analogous field; another instance of the two protocols' method namespaces needing to stay lexically separate in code (build brief anti-goal).
+- `SendMessageResponse` and `StreamResponse` are both `oneof` types (`payload`/`content` resp.) — check via `.WhichOneof("payload")` (`"task"` or `"message"`); A2A permits an agent to answer a `SendMessage` immediately with a bare `Message` and no `Task` at all. `tasks.py`'s `tools_call` handles both branches (see §13.3).
+- `AgentInterface.protocol_binding` is a **plain string field** ("JSONRPC"/"GRPC"/"HTTP+JSON"), not a generated enum — confirmed via the descriptor (`type: TYPE_STRING`), despite reading as enum-shaped in the prose spec.
+- `Part` is a `oneof` (`content`: `text`/`raw`/`url`/`data`) plus non-oneof `metadata`/`filename`/`media_type`. `artifacts.py` switches on `part.WhichOneof("content")`.
+- `TaskStatus.timestamp` is a `google.protobuf.Timestamp` (`HasField("timestamp")` to check presence, `.ToJsonString()` for MCP's ISO8601 `lastUpdatedAt`) — A2A's `Task` message has **no task-creation timestamp anywhere**, which is what forced the `iat`-dropping decision in §12a.
+- Agent-side JSON-RPC failures surface as `a2a.client.errors.A2AClientError` (or a more specific subclass, `A2AClientError`'s own fallback for unrecognized codes) — `tasks.py` catches this class specifically to wrap A2A failures as `DownstreamAgentError`, rather than swallowing a bare `Exception`.
+
+### 13.2 taskId is immutable for a task's whole lifecycle — this killed the `step` field
+
+Verified directly (not assumed) by reading `ext-tasks/schema/draft/schema.ts`: `UpdateTaskResult = Result` and `CancelTaskResult = Result` — both bare acknowledgements, neither echoes `taskId` or any `Task` data. There is no protocol mechanism for the server to hand the client a new/updated handle mid-lifecycle. Consequence recorded in §12a: the `step` field from the brief's original sketch is dead weight in the sealed-`taskId` design and was dropped before `state.py` was written, not after.
+
+### 13.3 `tools/call` must handle two response shapes A2A legitimately produces, both flagged in advance by the user and both implemented:
+
+1. **Immediate `TASK_STATE_INPUT_REQUIRED` on the very first `SendMessage` response.** With `return_immediately: true`, A2A does not guarantee the first status is `WORKING` — the agent may resolve to input-required before the bridge ever gets a chance to poll. `tasks.py::tools_call` builds the `CreateTaskResult` from whatever status the first response actually carries, rather than assuming `working`. Verified with a scriptable fake agent (`fake.initial_state = "TASK_STATE_INPUT_REQUIRED"`), not just asserted.
+2. **`SendMessage` answering with a bare `Message`, no `Task` at all.** A2A permits this for skills that don't need async handling. `tools_call` returns a plain (non-Tasks-extension) `CallToolResult`-shaped result in this case — `{resultType: "complete", content: [...]}}` — and skips the Tasks-capability check entirely, since no task was ever created for the client to need permission for.
+
+### 13.4 `-32021 MissingRequiredClientCapabilityError` is real, required behavior — not diagnostic-only after all
+
+M1 (§11.6) recorded this as gated behind a conformance-only diagnostic tool and out of scope. Wrong to leave unimplemented: the Tasks extension spec itself (`ext-tasks/specification/draft/tasks.md`) requires it — "Never return a task to a client that did not declare support." `tools_call` checks `params._meta["io.modelcontextprotocol/clientCapabilities"].extensions["io.modelcontextprotocol/tasks"]` before returning any `CreateTaskResult`, and rejects with `-32021` + `error.data.requiredCapabilities = {"io.modelcontextprotocol/tasks": {}}` + HTTP 400 if absent.
+
+**Real bug this caught in its own first draft, via the test suite (not conformance this time — my own integration test)**: because A2A's `return_immediately: true` already creates the task agent-side before the bridge can know whether the client is even allowed to have a handle for it (there's no way to ask A2A "would you create a task for this" without actually sending it), the naive implementation left the task running, orphaned, with no handle ever handed out. Fixed to best-effort `cancel_task` the orphan before returning the capability error. `tests/test_tasks.py::test_tools_call_without_declaring_tasks_extension_is_rejected` asserts the agent-side task ends up `TASK_STATE_CANCELED`, not merely absent.
+
+### 13.5 messageId idempotency — the trade-off, verified against a live fake agent
+
+Per the user's explicit direction: `SendMessage` MAY dedupe on `messageId` (A2A spec), so `messageId` must be **derived deterministically from the call**, not a fresh UUID per attempt, or an MCP-layer HTTP retry spawns a duplicate A2A task. Implemented as `a2a_client.stable_message_id(*parts)` — SHA-256 over the call's identifying parts (agent_id, skill_id, message text for a new call; agent_id, a2a_task_id, message text for a `tasks/update` continuation), truncated to 32 hex chars. `tests/test_tasks.py::test_retrying_tools_call_with_same_arguments_does_not_duplicate_the_a2a_task` confirms two identical calls produce the same `messageId`.
+
+**Named trade-off** (per the same discipline applied to the envelope in §12d): this also dedupes two *genuinely separate* calls that happen to carry identical content (same skill, same text) into one A2A message, since there's no client-supplied nonce available at the bridge layer to distinguish "the same call, retried" from "a deliberate exact repeat." Accepted for retry-safety; documented in `a2a_client.py`'s docstring, not hidden.
+
+### 13.6 Conformance suite re-run against a live instance with a working fake A2A agent (2026-08-11)
+
+- `http-header-validation`: still 13/14. The one remaining failure (`ServerAcceptsWhitespaceHeaderValue`) is **not a real gap**: verified via `--verbose` that the request passes header validation cleanly (proving Starlette/httptools already strips OWS from header values before this bridge's code ever sees them — no whitespace-handling bug exists) and reaches dispatch; it then correctly receives `-32021` because the scenario's generic conformance-client fixture doesn't declare the `io.modelcontextprotocol/tasks` extension, and this bridge's `tools/call` always attempts to open a task (real A2A skills are inherently asynchronous by design — see §3.1). The check only accepts a bare success response as proof of whitespace-handling; there is no way to make it pass without violating the Tasks extension's own "never return a task to a client that didn't declare support" rule. Not fixable without a spec violation; recorded, not chased further.
+- `tasks-capability-negotiation`: requires the server to expose specific hardcoded diagnostic fixture tools (`greet`, `slow_compute`) that the conformance harness calls by literal name. This bridge's tools are dynamically projected from configured A2A agents' skills, not hardcoded — same category of out-of-scope diagnostic-tool-gated scenario as M1's §11.6/§11.7 findings, not a real gap.
+
+---
+
