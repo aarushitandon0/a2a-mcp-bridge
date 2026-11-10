@@ -7,15 +7,24 @@ claim this is meant to support, and why it's phrased "no bridge-side
 state" rather than "stateless" -- the A2A agent still holds real task
 state; this bridge doesn't hold any of its own.
 
-**Status: written, not yet executed.** This was built in an environment
-without a Docker install (`docker`/`docker compose` unavailable), so
-nothing below has actually been run against real containers. `pytest`'s
-`tests/test_stateless.py` skips its three container-level tests with an
-explicit reason when Docker isn't on PATH rather than silently passing --
-run it somewhere Docker exists and treat those three tests, not this
-document, as the actual M4 acceptance check.
+**Status: verified.** All three scenarios below pass. They were run with
+`demo/run_local.py`, which drives the same `driver.py` scenarios against real
+processes (three bridges, one fake agent, a round-robin proxy with no
+affinity) instead of containers. The recorded transcript is in the
+top-level README's "Multi-instance deployment" section. The Docker path
+(`run_demo.py`, and the three container-level tests in
+`tests/test_stateless.py`) runs the same scenarios against containers; it
+needs a Docker install that can pull `nginx:1.27-alpine`.
 
 ## Running it
+
+Without Docker:
+
+```
+python demo/run_local.py
+```
+
+With Docker:
 
 ```
 export BRIDGE_STATE_KEY="$(python -c 'import base64,os;print(base64.urlsafe_b64encode(os.urandom(32)).decode())')"
@@ -25,8 +34,7 @@ python demo/run_demo.py
 This builds and starts the stack (`docker compose up -d --build`), runs all
 three scenarios below in sequence against it, prints a transcript, and
 tears the stack down (`docker compose down -v`) whether or not it
-succeeded. Once it has actually been run, its transcript belongs in the
-top-level README's M4 section as the "scripted demo with captured output."
+succeeded.
 
 To run just the automated pytest version:
 
