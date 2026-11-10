@@ -1,6 +1,18 @@
 # a2a-mcp-bridge
 
+**Every A2A agent, as an MCP tool.**
+
+![MCP 2026-07-28](https://img.shields.io/badge/MCP-2026--07--28-4F46E5) ![A2A 1.0](https://img.shields.io/badge/A2A-1.0-0D9488) ![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-0F172A) ![tests](https://img.shields.io/badge/tests-102%20passing-16A34A) ![bridge-side state](https://img.shields.io/badge/bridge--side%20state-none-0F172A)
+
+![a2a-mcp-bridge: an MCP client calls tools; the bridge translates to A2A agents](docs/assets/01-hero.png)
+
 A bridge server that exposes Agent2Agent (A2A) remote agents as tools to Model Context Protocol (MCP) clients. It is built natively against the MCP `2026-07-28` specification revision and targets A2A 1.0. See `SPEC-NOTES.md` for the protocol research.
+
+**Kill it mid-task and the task still finishes.** The bridge keeps no task state in memory, so any instance can resume any task. This is verified by a recorded run: three instances, round-robin, no affinity ([details](#multi-instance-deployment)).
+
+![A task end to end: tools/call, the agent asks a question, the client answers, completed](docs/assets/lifecycle.gif)
+
+**Write-up:** <!-- TODO: paste your blog/Medium link here --> *Every A2A agent, as an MCP tool: building a protocol bridge that holds no state.*
 
 ## Overview
 
@@ -17,6 +29,8 @@ The bridge holds no state of its own beyond static configuration. Every piece of
 - **No hand-rolled protocol types.** A2A types come from the official `a2a-sdk`. Every field name, header name, method name, and JSON shape used in the implementation traces back to a documented source in `SPEC-NOTES.md`.
 
 ## Architecture
+
+![Architecture: MCP client, the bridge's eight modules, A2A agents](docs/assets/02-architecture.png)
 
 ```
 MCP client
@@ -176,6 +190,8 @@ Cancels a task. Requires only `taskId`.
 
 Every A2A `TaskState` value maps to exactly one MCP task status. The mapping is implemented as an exhaustive match; a state value not in this table causes the bridge to raise rather than guess.
 
+![Eight A2A TaskStates mapped onto five MCP statuses](docs/assets/03-state-mapping.png)
+
 | A2A `TaskState` | MCP status |
 |---|---|
 | `TASK_STATE_SUBMITTED` | `working` |
@@ -202,6 +218,8 @@ The client answers by calling `tasks/update` with `inputResponses` keyed `"respo
 
 ### Authentication challenges
 
+![INPUT_REQUIRED vs AUTH_REQUIRED: only one path can ever carry content back](docs/assets/05-input-vs-auth.png)
+
 `TASK_STATE_AUTH_REQUIRED` collapses to the same MCP status (`input_required`) as an ordinary prompt, because MCP's status enum has no separate value for it, but it is never treated the same way internally. This distinction exists because A2A requires credentials to be exchanged out-of-band unless an in-band mechanism was explicitly negotiated, and the agent may resume entirely on its own once it observes the credential arrive through that out-of-band channel, with no follow-up message required from the client at all.
 
 Anything placed in MCP's `inputResponses` travels through the calling model's context: transcripts, logs, and anywhere else that context is persisted or forwarded. Routing a password or API key through that path would expose it in exactly the places A2A's own design, and MCP's own SEP-1036 url-mode elicitation pattern, are both built to keep credentials out of.
@@ -217,6 +235,8 @@ This is a deliberate trade-off, not an oversight: the A2A specification says age
 ## Task handle design
 
 The MCP `taskId` returned from `tools/call` is not a random identifier backed by a server-side lookup table. It is a sealed, self-describing envelope: an AES-256-GCM-encrypted, CBOR-encoded structure containing the A2A agent id, the A2A task id, the A2A context id, and an expiry timestamp. Any bridge instance holding the correct seal key can unseal it and resume the task without needing to have seen the original request, which is what makes running multiple stateless instances behind a load balancer possible.
+
+![Anatomy of a sealed taskId: CBOR array, AES-256-GCM, base64url](docs/assets/04-sealed-handle.png)
 
 Two costs are accepted deliberately in exchange for that property:
 
@@ -253,6 +273,8 @@ A2A task artifacts are summarized before being placed into a tool result, never 
 ./.venv/Scripts/python -m pytest
 ```
 
+102 tests pass in about 8 seconds. The three container-level tests in `test_stateless.py` additionally need Docker; see below for a run that needs no Docker.
+
 The test suite is organized by module: `test_mapping.py` covers the pure A2A-to-MCP translation functions in isolation, `test_state_envelope.py` covers sealing, unsealing, and every handle-rejection path, `test_tasks.py` covers the full `tools/call` through `tasks/update`/`tasks/cancel` lifecycle against a scriptable fake A2A agent, `test_discover.py` and `test_server.py` cover discovery and header validation, and `test_stateless.py` covers cross-instance task resumption (see Multi-instance deployment below).
 
 The fake A2A agent used throughout the test suite (`demo/fake_agent/agent.py`) is the same implementation used by the multi-instance deployment demo, kept as a single source of truth so the two never describe two different agents with subtly different wire behavior.
@@ -269,14 +291,69 @@ Three scenarios are exercised, driven by shared code in `demo/driver.py` so the 
 
 nginx is configured with plain round-robin balancing and no session affinity: no IP-hash routing, no cookie-based stickiness, and no persistent keep-alive connection to a single backend, since any of those would defeat the point of the demonstration by pinning a client to one instance.
 
-A general note on how to read this section: the demo and its associated code exist and are believed correct based on their design and on the fact that the individual pieces (the fake agent, the header-based instance identification, the sealing and unsealing logic) are independently tested elsewhere in the suite. Whether it has actually been exercised against real Docker containers in a given environment is a separate question; check `tests/test_stateless.py`'s container-level tests directly (they are skipped, with an explicit reason visible under `pytest -rs`, in any environment without a working Docker installation) rather than assuming from this document alone. See `demo/README.md` for the current status and instructions for running it.
+### Verified run
 
-## Known limitations
+All three scenarios pass. This is a recorded run (`demo/run_local.py`), with the instance names and handle prefixes exactly as printed:
 
-- Artifact detail beyond the summarized preview is not yet retrievable through a follow-up call.
-- `TASK_STATE_AUTH_REQUIRED` cannot be answered in-band, only acknowledged or cancelled, as described above.
-- Task handles carry no true creation timestamp.
-- Identity propagation across an agent chain (RFC 8693 token exchange, an `act` claim carried through to the A2A call) is not implemented.
+![Kill the instance mid-task: the answer lands on an instance that never saw the task, and it completes](docs/assets/failover.gif)
+
+```text
+=== 1. Kill the serving instance mid-task ===
+tools/call -> taskId=lVsthZDzQnm4pJU2... served by instance=bridge2
+tasks/get -> status=input_required, served by instance=bridge3
+kill bridge2 (the instance that served the original call)
+tasks/update (answering the prompt) -> served by instance=bridge1
+tasks/get -> status=completed, served by instance=bridge3
+PASS
+
+=== 2. Restart the whole pool while a task is paused ===
+tools/call -> taskId=K8ci9mwh_ozap77l... served by instance=bridge1
+tasks/get -> status=input_required, served by instance=bridge2
+restart bridge1 bridge2 bridge3 (all three, none survive)
+tasks/update (answering the prompt) -> served by instance=bridge1
+tasks/get -> status=completed, served by instance=bridge2
+PASS
+
+=== 3. Rotate the seal key across the pool ===
+tools/call -> taskId=J4ZN-Bb3YeBg7ljl... served by instance=bridge3
+tasks/get -> status=input_required, served by instance=bridge1
+handle minted under BRIDGE_STATE_KEY=A: taskId=J4ZN-Bb3YeBg7ljl...
+rotating bridge1, bridge2, bridge3 one at a time to KEY_B (KEY_A as PREVIOUS)
+tasks/update on the KEY_A-sealed handle, post-rotation -> served by instance=bridge3
+tasks/get -> status=completed (old handle survived the rotation window)
+a fresh tools/call after rotation -> taskId=Bz9ssjpEPiU34a54... (now sealed under KEY_B)
+PASS
+```
+
+![Key rotation: a handle sealed under key A survives a rolling rotation to key B](docs/assets/key-rotation.gif)
+
+### Running it yourself
+
+**Without Docker** (about 10 seconds; real processes on localhost):
+
+```
+./.venv/bin/python demo/run_local.py
+```
+
+This starts three bridge processes on ports 9001 to 9003, one fake A2A agent, and a round-robin proxy on port 8080 that mirrors `demo/nginx.conf` (no affinity; it skips a backend only when its connection is refused). It runs the same `demo/driver.py` scenarios, with `docker kill` and `docker compose restart` replaced by real process kills and restarts.
+
+**With Docker** (three containers behind nginx):
+
+```
+export BRIDGE_STATE_KEY="$(python -c 'import base64,os;print(base64.urlsafe_b64encode(os.urandom(32)).decode())')"
+python demo/run_demo.py
+```
+
+See `demo/README.md` for what each scenario asserts and the harness constraints it depends on.
+
+## Roadmap
+
+- **Full artifact retrieval.** Fetch an artifact's complete content beyond the summarized preview through `resources/read`, with a URI that is itself a sealed handle, so there is still no bridge-side state.
+- **Opt-in in-band auth negotiation.** Today `TASK_STATE_AUTH_REQUIRED` is acknowledged or cancelled only, never answered in-band (see above). A per-agent opt-in for agents that negotiate in-band is a natural next step.
+- **True creation timestamps.** Task handles currently report `createdAt` as the latest `lastUpdatedAt`.
+- **Identity propagation across agent chains.** RFC 8693 token exchange, with an `act` claim carried through to the A2A call.
+
+Contributions and issues are welcome, especially from people running A2A agents in production.
 
 ## Project layout
 
@@ -295,5 +372,7 @@ tests/
     test_server.py, test_a2a_client.py, test_artifacts.py, test_stateless.py
 demo/
     docker-compose.yml, nginx.conf, Dockerfile.bridge, Dockerfile.fake_agent,
-    driver.py, run_demo.py, fake_agent/, README.md
+    driver.py, run_demo.py, run_local.py, fake_agent/, README.md
+docs/assets/
+    diagrams and GIFs used in this README
 ```
